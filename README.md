@@ -1,16 +1,164 @@
-## Hi there 👋
+import logging
+import os
+import json
+import asyncio
+import aiofiles
+import httpx
+import pinecone
+import zoomus
+import speech_recognition as sr
+from datetime import datetime
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from langchain.llms import OpenAI
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from dateutil.parser import parse
+from functools import lru_cache
 
-<!--
-**CoachSOPHI/CoachSOPHI** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+# Configuration des logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-Here are some ideas to get you started:
+# Chargement des variables d'environnement
+load_dotenv()
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+# Vérification des variables d'environnement
+REQUIRED_ENV_VARS = ["OPENAI_API_KEY", "PINECONE_API_KEY", "ZOOM_API_KEY", "ZOOM_API_SECRET"]
+MISSING_VARS = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+if MISSING_VARS:
+    raise ValueError(f"Variables d'environnement manquantes : {', '.join(MISSING_VARS)}")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+ZOOM_API_KEY = os.getenv("ZOOM_API_KEY")
+ZOOM_API_SECRET = os.getenv("ZOOM_API_SECRET")
+
+# Initialisation de FastAPI
+app = FastAPI(title="Coach Sophie API", description="API de coaching intelligent", version="1.0")
+security = HTTPBearer()
+
+# Initialisation du modèle GPT-4
+try:
+    llm = OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    logging.exception("Erreur lors de l'initialisation du modèle OpenAI")
+    raise
+
+# Initialisation de Pinecone
+try:
+    pinecone.init(api_key=PINECONE_API_KEY, environment="us-west1-gcp")
+    index = pinecone.Index("coach-sophie")
+except Exception as e:
+    logging.exception("Erreur lors de l'initialisation de Pinecone")
+    index = None
+
+# Initialisation de Zoom
+try:
+    zoom_client = zoomus.ZoomClient(ZOOM_API_KEY, ZOOM_API_SECRET)
+except Exception as e:
+    logging.exception("Erreur lors de l'initialisation de Zoom")
+    zoom_client = None
+
+# Base de données locale
+DATABASE_FILES = {"objectives": "objectives.json", "habits": "habits.json", "reports": "reports.json"}
+lock = asyncio.Lock()
+
+async def load_data(filename):
+    async with lock:
+        if not os.path.exists(filename):
+            return {}
+        try:
+            async with aiofiles.open(filename, "r", encoding="utf-8") as file:
+                content = await file.read()
+                return json.loads(content)
+        except json.JSONDecodeError:
+            logging.error(f"Erreur de décodage JSON pour {filename}")
+            return {}
+
+async def save_data(filename, data):
+    async with lock:
+        try:
+            async with aiofiles.open(filename, "w", encoding="utf-8") as file:
+                await file.write(json.dumps(data, indent=4, ensure_ascii=False))
+        except Exception as e:
+            logging.exception(f"Erreur lors de l'écriture du fichier {filename}")
+
+# Vérification de l'authentification
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    if token != os.getenv("SECURE_TOKEN", "secure-token"):  # Utilisation d'un token sécurisé
+        raise HTTPException(status_code=403, detail="Token invalide")
+    return token
+
+# Modèles de requête
+class UserRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, example="user_123")
+    message: str = Field(..., min_length=1, example="Comment améliorer ma productivité ?")
+
+class GoalRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, example="user_123")
+    goal: str = Field(..., min_length=1, example="Faire du sport 3 fois par semaine")
+
+@app.get("/health", summary="Vérifie l'état de l'API")
+async def health_check():
+    return {
+        "status": "OK",
+        "openai": llm is not None,
+        "pinecone": index is not None,
+        "zoom": zoom_client is not None
+    }
+
+@lru_cache(maxsize=128)
+def query_pinecone(message):
+    if not index:
+        return None
+    try:
+        return index.query(message, top_k=3, include_metadata=True)
+    except Exception as e:
+        logging.exception("Erreur lors de la requête Pinecone")
+        return None
+
+@app.post("/chat", summary="Chat avec Coach Sophie")
+async def chat(request: UserRequest, user: str = Depends(get_current_user)):
+    context = query_pinecone(request.message)
+    if context is None:
+        raise HTTPException(status_code=500, detail="Service de base de connaissances indisponible")
+    try:
+        prompt = f"""
+        Tu es Coach Sophie. Réponds en utilisant les informations de contexte :
+        Contexte : {json.dumps(context, indent=2, ensure_ascii=False)}
+        Message utilisateur : {request.message}
+        """
+        response = llm(prompt)
+        return {"response": response}
+    except Exception as e:
+        logging.exception("Erreur dans /chat")
+        raise HTTPException(status_code=500, detail="Erreur lors du traitement de la requête")
+
+@app.post("/schedule_zoom", summary="Planifier une réunion Zoom")
+async def schedule_zoom(request: Request, user: str = Depends(get_current_user)):
+    if not zoom_client:
+        raise HTTPException(status_code=500, detail="Service Zoom indisponible")
+    try:
+        data = await request.json()
+        topic = data.get("topic", "Séance de coaching avec Coach Sophie")
+        start_time = data.get("start_time")
+        if not start_time:
+            raise HTTPException(status_code=400, detail="start_time est requis et doit être au format ISO 8601")
+        try:
+            parse(start_time)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="start_time doit être au format ISO 8601")
+        duration = data.get("duration", 60)
+        meeting = zoom_client.meeting.create(
+            topic=topic,
+            type=2,
+            start_time=start_time,
+            duration=duration,
+            timezone="UTC"
+        )
+        return {"meeting_url": meeting["join_url"], "meeting_id": meeting["id"]}
+    except Exception as e:
+        logging.exception("Erreur dans /schedule_zoom")
+        raise HTTPException(status_code=500, detail="Erreur lors de la planification de Zoom")
