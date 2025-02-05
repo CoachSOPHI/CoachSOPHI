@@ -33,6 +33,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 ZOOM_API_KEY = os.getenv("ZOOM_API_KEY")
 ZOOM_API_SECRET = os.getenv("ZOOM_API_SECRET")
+SECURE_TOKEN = os.getenv("SECURE_TOKEN", "secure-token")
 
 # Initialisation de FastAPI
 app = FastAPI(title="Coach Sophie API", description="API de coaching intelligent", version="1.0")
@@ -86,10 +87,9 @@ async def save_data(filename, data):
 
 # Vérification de l'authentification
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if token != os.getenv("SECURE_TOKEN", "secure-token"):  # Utilisation d'un token sécurisé
+    if credentials.credentials != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Token invalide")
-    return token
+    return credentials.credentials
 
 # Modèles de requête
 class UserRequest(BaseModel):
@@ -162,3 +162,18 @@ async def schedule_zoom(request: Request, user: str = Depends(get_current_user))
     except Exception as e:
         logging.exception("Erreur dans /schedule_zoom")
         raise HTTPException(status_code=500, detail="Erreur lors de la planification de Zoom")
+
+# Génération du fichier requirements.txt
+with open("requirements.txt", "w") as req_file:
+    req_file.write("""
+    fastapi
+    uvicorn
+    httpx
+    langchain
+    pinecone-client
+    speechrecognition
+    python-dotenv
+    aiofiles
+    zoomus
+    dateutil
+    """)
