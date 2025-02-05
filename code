@@ -162,6 +162,8 @@ async def schedule_zoom(request: Request, user: str = Depends(get_current_user))
     except Exception as e:
         logging.exception("Erreur dans /schedule_zoom")
         raise HTTPException(status_code=500, detail="Erreur lors de la planification de Zoom")
+import os
+print("Répertoire courant:", os.getcwd())
 
 # Génération du fichier requirements.txt
 with open("requirements.txt", "w") as req_file:
